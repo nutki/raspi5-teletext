@@ -22,12 +22,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 #include <time.h>
 #include <assert.h>
 #include <unistd.h>
 #include <sys/time.h>
-
-#include "bcm_host.h"
 
 #include "render.h"
 #include "buffer.h"

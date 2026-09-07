@@ -1,8 +1,8 @@
+#include <stdint.h>
+
 #ifndef ALIGN_UP
 #define ALIGN_UP(x,y) ((x + (y)-1) & ~((y)-1))
 #endif
-
-#define TYPE (VC_IMAGE_8BPP)
 
 #define PITCH(w) (ALIGN_UP(w, 32))
 

@@ -1,173 +1,320 @@
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-#include "bcm_host.h"
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <libdrm/drm_fourcc.h>
 
 #include "render.h"
 
+#define DRM_DEVICE "/dev/dri/card0"
+#define OUTPUT_WIDTH 720
+#define OUTPUT_HEIGHT 576
+
+typedef struct drm_buffer {
+    uint32_t handle;
+    uint32_t framebuffer;
+    uint32_t pitch;
+    uint64_t size;
+    uint8_t *map;
+} drm_buffer;
+
 
 typedef struct render_shared {
-    DISPMANX_DISPLAY_HANDLE_T   display;
-    DISPMANX_ELEMENT_HANDLE_T   element;
-    DISPMANX_RESOURCE_HANDLE_T  resource[2];
+    int fd;
+    uint32_t connector_id;
+    uint32_t crtc_id;
+    drmModeCrtc *saved_crtc;
+    drmModeModeInfo mode;
+    drm_buffer buffer[2];
 
-    pthread_cond_t cond;
-    pthread_mutex_t lock;
     pthread_t thread;
-    int done;
+    volatile int done;
 
     uint8_t *image;
     int width;
-    VC_RECT_T image_rect;
+    int height;
     DrawFunc draw_func;
     int delay;
+    uint32_t white;
 } render_shared;
+
+
+static void die(const char *message)
+{
+    perror(message);
+    abort();
+}
+
+
+static void check(int result, const char *message)
+{
+    if (result < 0) die(message);
+}
+
+
+static void create_buffer(render_shared *r, drm_buffer *buffer)
+{
+    struct drm_mode_create_dumb create = {0};
+    struct drm_mode_map_dumb map = {0};
+    uint32_t handles[4] = {0};
+    uint32_t pitches[4] = {0};
+    uint32_t offsets[4] = {0};
+
+    create.width = OUTPUT_WIDTH;
+    create.height = OUTPUT_HEIGHT;
+    create.bpp = 32;
+    check(drmIoctl(r->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create), "DRM_IOCTL_MODE_CREATE_DUMB");
+
+    buffer->handle = create.handle;
+    buffer->pitch = create.pitch;
+    buffer->size = create.size;
+    handles[0] = buffer->handle;
+    pitches[0] = buffer->pitch;
+    check(drmModeAddFB2(r->fd, OUTPUT_WIDTH, OUTPUT_HEIGHT,
+                        DRM_FORMAT_XRGB8888, handles, pitches, offsets,
+                        &buffer->framebuffer, 0),
+          "drmModeAddFB2");
+
+    map.handle = buffer->handle;
+    check(drmIoctl(r->fd, DRM_IOCTL_MODE_MAP_DUMB, &map),
+          "DRM_IOCTL_MODE_MAP_DUMB");
+    buffer->map = mmap(NULL, buffer->size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, r->fd, map.offset);
+    if (buffer->map == MAP_FAILED) die("mmap");
+    memset(buffer->map, 0, buffer->size);
+}
+
+
+static void destroy_buffer(render_shared *r, drm_buffer *buffer)
+{
+    struct drm_mode_destroy_dumb destroy = {0};
+
+    if (buffer->map && buffer->map != MAP_FAILED)
+        munmap(buffer->map, buffer->size);
+    if (buffer->framebuffer)
+        drmModeRmFB(r->fd, buffer->framebuffer);
+    if (buffer->handle) {
+        destroy.handle = buffer->handle;
+        drmIoctl(r->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+    }
+}
+
+
+static void copy_to_scanout(render_shared *r, drm_buffer *buffer)
+{
+    uint32_t *pixels = (uint32_t *)buffer->map;
+    uint32_t white = r->white & 0x00ffffff;
+    int y, x;
+
+    memset(buffer->map, 0, buffer->size);
+    for (y = 0; y < r->height && y < OUTPUT_HEIGHT; y++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)pixels + (y + 0) * buffer->pitch);
+        for (x = 0; x < OUTPUT_WIDTH; x++) {
+            const uint8_t *source_row = r->image + y * PITCH(r->width);
+            int source_x = (x * (r->width)) / OUTPUT_WIDTH;
+            row[x] = source_row[source_x] ? (0xff000000 | white) : 0xff000000;
+        }
+    }
+    for (y = 0; y < r->height && y < OUTPUT_HEIGHT; y++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)pixels + (y + 100) * buffer->pitch);
+        for (x = 0; x < OUTPUT_WIDTH; x++) {
+            uint64_t source_position;
+            uint32_t source_x0;
+            uint32_t source_x1;
+            uint32_t fraction;
+            uint32_t intensity;
+            uint64_t weighted_intensity;
+            const uint8_t *source_row = r->image + y * PITCH(r->width);
+
+            if (r->width <= 1) {
+                intensity = source_row[0] ? 65535 : 0;
+            } else {
+                // Use 64-bit arithmetic: the fixed-point product exceeds
+                // uint32_t before it is divided by the output width.
+                source_position = (uint64_t)x * (r->width - 1) * 65536 /
+                                  (OUTPUT_WIDTH - 1);
+                source_x0 = source_position >> 16;
+                source_x1 = source_x0 < (uint32_t)(r->width - 1) ? source_x0 + 1 : source_x0;
+                fraction = source_position & 0xffff;
+                weighted_intensity = (uint64_t)(source_row[source_x0] ? 65535 : 0) *
+                                     (65536 - fraction) +
+                                     (uint64_t)(source_row[source_x1] ? 65535 : 0) * fraction;
+                intensity = (weighted_intensity + 32768) >> 16;
+            }
+            row[x] = 0xff000000 | (uint32_t)(((uint64_t)white * intensity + 32767) / 65535);
+        }
+    }
+}
+
+
+static void page_flip_handler(int fd, unsigned int frame,
+                              unsigned int seconds, unsigned int useconds,
+                              void *data)
+{
+    (void)fd;
+    (void)frame;
+    (void)seconds;
+    (void)useconds;
+    *(int *)data = 1;
+}
+
+
+static void wait_for_flip(render_shared *r, int *complete)
+{
+    drmEventContext event = {0};
+    struct pollfd pollfd = {r->fd, POLLIN, 0};
+
+    event.version = DRM_EVENT_CONTEXT_VERSION;
+    event.page_flip_handler = page_flip_handler;
+    while (!*complete) {
+        check(poll(&pollfd, 1, -1), "poll DRM page flip");
+        check(drmHandleEvent(r->fd, &event), "drmHandleEvent");
+    }
+}
 
 
 void *render_thread_func(void *anon_render_shared)
 {
-    int ret;
-    int next_resource = 0;
-    DISPMANX_UPDATE_HANDLE_T update;
     render_shared *r = anon_render_shared;
+    int next_buffer = 1;
 
     while(!r->done) {
-        update = vc_dispmanx_update_start(10);
-        assert(update);
-        ret = vc_dispmanx_element_change_source(update, r->element, r->resource[next_resource]);
-        assert(ret == 0);
-        pthread_cond_wait(&r->cond, &r->lock);
-        // RPi firmware sends the vsync callback with just a few ms to spare before it
-        // paints the next frame, so we must put a delay here to guarantee that we
-        // always miss the current frame, in order to get a stable framerate.
-        // See https://github.com/raspberrypi/firmware/issues/1182
-        // and https://github.com/raspberrypi/firmware/issues/1154
-        usleep(r->delay);
-        ret = vc_dispmanx_update_submit(update, NULL, NULL );
-        assert(ret == 0);
-        next_resource ^= 1;
-        r->draw_func(r->image, next_resource);
-        ret = vc_dispmanx_resource_write_data(r->resource[next_resource], TYPE, PITCH(r->width), r->image, &r->image_rect);
-        assert(ret == 0);
+        r->draw_func(r->image, next_buffer);
+        copy_to_scanout(r, &r->buffer[next_buffer]);
+          int complete = 0;
+
+          check(drmModePageFlip(r->fd, r->crtc_id,
+                              r->buffer[next_buffer].framebuffer,
+                        DRM_MODE_PAGE_FLIP_EVENT, &complete),
+              "drmModePageFlip");
+        wait_for_flip(r, &complete);
+        next_buffer ^= 1;
+//        if (r->delay > 0) usleep(r->delay);
     }
 
     return NULL;
 }
 
 
-void vsync_callback(DISPMANX_UPDATE_HANDLE_T u, void *anon_render_shared)
+static drmModeConnector *find_connector(int fd, uint32_t *connector_id,
+                                        drmModeModeInfo *mode)
 {
-    render_shared *r = anon_render_shared;
-    pthread_cond_signal(&r->cond);
+    drmModeRes *resources = drmModeGetResources(fd);
+    drmModeConnector *found = NULL;
+    int i, n;
+
+    if (!resources) die("drmModeGetResources");
+    for (i = 0; i < resources->count_connectors && !found; i++) {
+        drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
+        if (!connector) continue;
+        if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes) {
+            for (n = 0; n < connector->count_modes; n++) {
+                if (connector->modes[n].hdisplay == OUTPUT_WIDTH &&
+                    connector->modes[n].vdisplay == OUTPUT_HEIGHT) {
+                    *connector_id = connector->connector_id;
+                    *mode = connector->modes[n];
+                    found = connector;
+                    break;
+                }
+            }
+        }
+        if (!found) drmModeFreeConnector(connector);
+    }
+    drmModeFreeResources(resources);
+    return found;
 }
 
 
 void *render_start(int width, int height, int offset, int fixed, InitFunc init_func, DrawFunc draw_func, int delay, int level)
 {
-    int ret;
-
-    level = (int)((level * 31) / 100.0);
-    int white = 0x0020 | level | level << 6 | level << 11;
-
-    VC_RECT_T src_rect;
-    VC_RECT_T dst_rect;
-
-    DISPMANX_UPDATE_HANDLE_T update;
-    uint32_t vc_image_ptr;
-    unsigned short palette[256] = { 0x0, white, 0xf000 };
-
-    // Build the render struct. Must malloc it so it is still valid
-    // after this function returns.
     render_shared *r = (render_shared *)calloc(1, sizeof(render_shared));
+    drmModeConnector *connector;
+    drmModeEncoder *encoder = NULL;
+    drmModeRes *resources;
+    int i;
 
-    pthread_cond_init(&r->cond, NULL);
-    pthread_mutex_init(&r->lock, NULL);
+    // The staging image already includes OFFSET/FIXED. DRM copies the full
+    // image to the scanout buffer, so these legacy partial-update arguments
+    // are intentionally unused.
+    (void)offset;
+    (void)fixed;
 
     r->draw_func = draw_func;
-    if (delay > -1) {
-        r->delay = delay;
-    } else {
-        r->delay = 2000;
-    }
+    r->delay = delay > -1 ? delay : 2000;
     r->width = width;
+    r->height = height;
+    r->white = ((uint32_t)((level < 0 ? 0 : level > 100 ? 100 : level) * 255 / 100) * 0x010101) | 0xff000000;
     r->image = calloc(1, PITCH(width) * height);
     assert(r->image);
     init_func(r->image);
 
-    bcm_host_init();
-    r->display = vc_dispmanx_display_open(0);
+    r->fd = open(DRM_DEVICE, O_RDWR | O_CLOEXEC);
+    if (r->fd < 0) die(DRM_DEVICE);
+    check(drmSetClientCap(r->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1),
+          "drmSetClientCap");
+    connector = find_connector(r->fd, &r->connector_id, &r->mode);
+    if (!connector) die("720x576 PAL connector not found");
 
-    // set up some resources
-    vc_dispmanx_rect_set(&r->image_rect, 0, 0, width, height);
-    for (int n=0;n<2;n++) {
-        r->resource[n] = vc_dispmanx_resource_create(TYPE, width, height, &vc_image_ptr);
-        assert(r->resource[n]);
-        ret = vc_dispmanx_resource_set_palette(r->resource[n], palette, 0, sizeof palette);
-        assert(ret == 0);
-        ret = vc_dispmanx_resource_write_data(r->resource[n], TYPE, PITCH(width), r->image, &r->image_rect);
-        assert(ret == 0);
+    resources = drmModeGetResources(r->fd);
+    if (!resources) die("drmModeGetResources");
+    for (i = 0; i < connector->count_encoders; i++) {
+        encoder = drmModeGetEncoder(r->fd, connector->encoders[i]);
+        if (encoder) {
+            int crtc_index;
+            for (crtc_index = 0; crtc_index < resources->count_crtcs; crtc_index++) {
+                if (encoder->possible_crtcs & (1 << crtc_index)) {
+                    r->crtc_id = resources->crtcs[crtc_index];
+                    break;
+                }
+            }
+            if (crtc_index < resources->count_crtcs) break;
+        }
+        if (encoder) drmModeFreeEncoder(encoder);
+        encoder = NULL;
     }
-    vc_dispmanx_rect_set(&r->image_rect, offset+fixed, 0, width - (offset+fixed), height); // from now on, only copy the parts that change
-
-    update = vc_dispmanx_update_start(10);
-    assert(update);
-
-    vc_dispmanx_rect_set(&src_rect, 0, 0, width << 16, height << 16);
-    vc_dispmanx_rect_set(&dst_rect, 0, 0, 720, height);
-    r->element = vc_dispmanx_element_add(update, r->display, 2000,
-                                      &dst_rect, r->resource[2], &src_rect,
-                                      DISPMANX_PROTECTION_NONE,
-                                      NULL, NULL, VC_IMAGE_ROT0);
-
-    ret = vc_dispmanx_update_submit_sync(update);
-    assert(ret == 0);
-
+    if (!encoder || !resources->count_crtcs) die("DRM encoder/CRTC not found");
+    if (!r->crtc_id) r->crtc_id = encoder->crtc_id;
+    r->saved_crtc = drmModeGetCrtc(r->fd, r->crtc_id);
+    drmModeFreeEncoder(encoder);
+    drmModeFreeResources(resources);
+    create_buffer(r, &r->buffer[0]);
+    create_buffer(r, &r->buffer[1]);
+    copy_to_scanout(r, &r->buffer[0]);
+    check(drmModeSetCrtc(r->fd, r->crtc_id, r->buffer[0].framebuffer,
+                         0, 0, &r->connector_id, 1, &r->mode),
+          "drmModeSetCrtc");
     r->done = 0;
-
-    // Start the drawing thread.
-    pthread_create(&r->thread, NULL, render_thread_func, r);
-
-    // BUG: Clear any existing callbacks, even to other apps.
-    // https://github.com/raspberrypi/userland/issues/218
-    // TODO: Check if we still need this.
-    vc_dispmanx_vsync_callback(r->display, NULL, NULL);
-
-    // Set the callback function.
-    vc_dispmanx_vsync_callback(r->display, vsync_callback, r);
+    if (pthread_create(&r->thread, NULL, render_thread_func, r) != 0)
+        die("pthread_create");
 
     return r;
 }
 
 
 void render_stop(void *anon_render_shared) {
-    int ret;
-    DISPMANX_UPDATE_HANDLE_T update;
-
     render_shared *r = anon_render_shared;
 
-    // Stop the thread first in case it is waiting on a signal.
     r->done = 1;
     pthread_join(r->thread, NULL);
-
-    // Stop the vsync callbacks.
-    vc_dispmanx_vsync_callback(r->display, NULL, NULL);
-
-    // Destroy element and resources.
-    update = vc_dispmanx_update_start( 10 );
-    assert( update );
-    ret = vc_dispmanx_element_remove(update, r->element);
-    assert(ret == 0);
-    ret = vc_dispmanx_update_submit_sync(update);
-    assert(ret == 0);
-    for (int n=0; n<2; n++) {
-        ret = vc_dispmanx_resource_delete(r->resource[n]);
-        assert(ret == 0);
-    }
-    ret = vc_dispmanx_display_close(r->display);
-    assert(ret == 0);
-
-    pthread_cond_destroy(&r->cond);
-    pthread_mutex_destroy(&r->lock);
-
+    if (r->saved_crtc && r->saved_crtc->mode_valid)
+        drmModeSetCrtc(r->fd, r->crtc_id, r->saved_crtc->buffer_id,
+                       r->saved_crtc->x, r->saved_crtc->y,
+                       &r->connector_id, 1, &r->saved_crtc->mode);
+    destroy_buffer(r, &r->buffer[0]);
+    destroy_buffer(r, &r->buffer[1]);
+    drmModeFreeCrtc(r->saved_crtc);
+    close(r->fd);
+    free(r->image);
     free(r);
 }

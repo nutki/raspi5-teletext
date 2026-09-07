@@ -126,35 +126,6 @@ static void copy_to_scanout(render_shared *r, drm_buffer *buffer)
             row[x] = source_row[source_x] ? (0xff000000 | white) : 0xff000000;
         }
     }
-    for (y = 0; y < r->height && y < OUTPUT_HEIGHT; y++) {
-        uint32_t *row = (uint32_t *)((uint8_t *)pixels + (y + 100) * buffer->pitch);
-        for (x = 0; x < OUTPUT_WIDTH; x++) {
-            uint64_t source_position;
-            uint32_t source_x0;
-            uint32_t source_x1;
-            uint32_t fraction;
-            uint32_t intensity;
-            uint64_t weighted_intensity;
-            const uint8_t *source_row = r->image + y * PITCH(r->width);
-
-            if (r->width <= 1) {
-                intensity = source_row[0] ? 65535 : 0;
-            } else {
-                // Use 64-bit arithmetic: the fixed-point product exceeds
-                // uint32_t before it is divided by the output width.
-                source_position = (uint64_t)x * (r->width - 1) * 65536 /
-                                  (OUTPUT_WIDTH - 1);
-                source_x0 = source_position >> 16;
-                source_x1 = source_x0 < (uint32_t)(r->width - 1) ? source_x0 + 1 : source_x0;
-                fraction = source_position & 0xffff;
-                weighted_intensity = (uint64_t)(source_row[source_x0] ? 65535 : 0) *
-                                     (65536 - fraction) +
-                                     (uint64_t)(source_row[source_x1] ? 65535 : 0) * fraction;
-                intensity = (weighted_intensity + 32768) >> 16;
-            }
-            row[x] = 0xff000000 | (uint32_t)(((uint64_t)white * intensity + 32767) / 65535);
-        }
-    }
 }
 
 

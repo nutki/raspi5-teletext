@@ -18,8 +18,8 @@
 #include "render.h"
 
 #define DRM_DEVICE "/dev/dri/card0"
-#define OUTPUT_WIDTH 720
-#define OUTPUT_HEIGHT 576
+//#define TARGET_MODE "704x512i"
+#define TARGET_MODE "720x576i"
 
 typedef struct drm_buffer {
     uint32_t handle;
@@ -36,6 +36,8 @@ typedef struct render_shared {
     uint32_t crtc_id;
     drmModeCrtc *saved_crtc;
     drmModeModeInfo mode;
+    int output_width;
+    int output_height;
     drm_buffer buffer[2];
 
     pthread_t thread;
@@ -71,8 +73,8 @@ static void create_buffer(render_shared *r, drm_buffer *buffer)
     uint32_t pitches[4] = {0};
     uint32_t offsets[4] = {0};
 
-    create.width = OUTPUT_WIDTH;
-    create.height = OUTPUT_HEIGHT;
+    create.width = r->output_width;
+    create.height = r->output_height;
     create.bpp = 32;
     check(drmIoctl(r->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create), "DRM_IOCTL_MODE_CREATE_DUMB");
 
@@ -81,7 +83,7 @@ static void create_buffer(render_shared *r, drm_buffer *buffer)
     buffer->size = create.size;
     handles[0] = buffer->handle;
     pitches[0] = buffer->pitch;
-    check(drmModeAddFB2(r->fd, OUTPUT_WIDTH, OUTPUT_HEIGHT,
+    check(drmModeAddFB2(r->fd, r->output_width, r->output_height,
                         DRM_FORMAT_XRGB8888, handles, pitches, offsets,
                         &buffer->framebuffer, 0),
           "drmModeAddFB2");
@@ -110,7 +112,7 @@ static void destroy_buffer(render_shared *r, drm_buffer *buffer)
     }
 }
 
-
+static int alter = 1;
 static void copy_to_scanout(render_shared *r, drm_buffer *buffer)
 {
     uint32_t *pixels = (uint32_t *)buffer->map;
@@ -118,12 +120,19 @@ static void copy_to_scanout(render_shared *r, drm_buffer *buffer)
     int y, x;
 
     memset(buffer->map, 0, buffer->size);
-    for (y = 0; y < r->height && y < OUTPUT_HEIGHT; y++) {
+//    printf("%d -> %d\n", r->width, r->output_width);
+    for (y = 0; y < r->height && y < r->output_height; y++) {
         uint32_t *row = (uint32_t *)((uint8_t *)pixels + (y + 0) * buffer->pitch);
-        for (x = 0; x < OUTPUT_WIDTH; x++) {
+        uint32_t *row2 = (uint32_t *)((uint8_t *)pixels + (y + 120) * buffer->pitch);
+        for (x = 0; x < r->output_width; x++) {
             const uint8_t *source_row = r->image + y * PITCH(r->width);
-            int source_x = (x * (r->width)) / OUTPUT_WIDTH;
-            row[x] = source_row[source_x] ? (0xff000000 | white) : 0xff000000;
+            // ratio = pixel clock = 108Mhz/7 / teletext data clock  = 6.9375Mhz = 2.2239...
+            // offset (real data (clock runin) starts at 8)
+            int source_x = !alter ? (x * r->width) / r->output_width : x/2.223938223938224 + 6;
+            // row[x] = x&2 ? -1 : 0;
+            int v = source_x < r->width ? source_row[source_x] : 0;
+            row[x] = v ? (0xff000000 | white) : 0xff000000;
+            row2[x] = v ? (0xff00FF00) : 0xff000000;
         }
     }
 }
@@ -191,8 +200,7 @@ static drmModeConnector *find_connector(int fd, uint32_t *connector_id,
         if (!connector) continue;
         if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes) {
             for (n = 0; n < connector->count_modes; n++) {
-                if (connector->modes[n].hdisplay == OUTPUT_WIDTH &&
-                    connector->modes[n].vdisplay == OUTPUT_HEIGHT) {
+                if (!strcmp(connector->modes[n].name, TARGET_MODE)) {
                     *connector_id = connector->connector_id;
                     *mode = connector->modes[n];
                     found = connector;
@@ -235,7 +243,21 @@ void *render_start(int width, int height, int offset, int fixed, InitFunc init_f
     check(drmSetClientCap(r->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1),
           "drmSetClientCap");
     connector = find_connector(r->fd, &r->connector_id, &r->mode);
-    if (!connector) die("720x576 PAL connector not found");
+    if (!connector) die(TARGET_MODE " mode not found on a connected connector");
+    if (alter) {
+//   #0 704x512i 50.02 704 776 848 987 
+//   #1 720x576i 50.00 720 732 796 864
+        // r->mode.clock = 13845;//15429
+        // r->mode.hsync_end += 28;
+        // r->mode.hsync_start += 28;
+        r->mode.clock = 15429;
+        r->mode.htotal = 987;
+        r->mode.hdisplay = 822;
+        r->mode.hsync_start = 836;
+        r->mode.hsync_end = 909;
+    }
+    r->output_width = r->mode.hdisplay;
+    r->output_height = r->mode.vdisplay;
 
     resources = drmModeGetResources(r->fd);
     if (!resources) die("drmModeGetResources");

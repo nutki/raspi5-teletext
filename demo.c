@@ -55,10 +55,10 @@ void get_cpu(void)
     total = c[0] + c[1] + c[2] + c[3];
     memcpy (a, b, sizeof a);
 
-    str_parity(&buffer[0][10][26], 12, "User:\x03%5.1f%%", c[0]*100.0/total);
-    str_parity(&buffer[0][11][26], 12, "Nice:\x03%5.1f%%", c[1]*100.0/total);
-    str_parity(&buffer[0][12][26], 12, "Sys.:\x03%5.1f%%", c[2]*100.0/total);
-    str_parity(&buffer[0][13][26], 12, "Idle:\x03%5.1f%%", c[3]*100.0/total);
+    str_parity(&buffer[0][10][26], 12, "User:\x03%5.1Lf%%", c[0]*100.0/total);
+    str_parity(&buffer[0][11][26], 12, "Nice:\x03%5.1Lf%%", c[1]*100.0/total);
+    str_parity(&buffer[0][12][26], 12, "Sys.:\x03%5.1Lf%%", c[2]*100.0/total);
+    str_parity(&buffer[0][13][26], 12, "Idle:\x03%5.1Lf%%", c[3]*100.0/total);
 
 }
 

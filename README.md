@@ -1,33 +1,44 @@
-Teletext for Raspberry Pi
+Teletext for Raspberry Pi5
 -------------------------
 
 This software generates a teletext signal in software. No hardware
-mods are needed.
-
-This support both PAL (Teletext) and NTSC (CEA608 format captions).
-
-(The demo mode should no longer crash TVs!)
+mods are needed. Ported from https://github.com/ali1234/raspi-teletext
+Instead of using direct register writes to VideoCore (with `tvctl`),
+it relies on a modified `drm-rp1-vec` driver.
+Because Pi5's video encoder is missing a composer, the downside compared
+to original is that it is not possible to share composite output with
+other software (though it is possible to integrate teletext display with
+custom programs directly accessing drm API). But on the upside since the
+driver modification expands the display into tetelext range instead
+of shifting upwards like `tvctl` does, the whole screen is still availiable
+for display. Also Pi5 allows to use HDMI and composite output at the same
+time, so it is possible to run X on HDMI and teletext.
 
 Usage:
 
-Have a Raspberry Pi connected to a TV by composite video.
-It doesn't matter if you are running X or not. Dispmanx will draw over
-anything else.
+First the kernel patch `drm-rp1-vec.patch` needs to be applied. No full
+compilation instructions available now, but the script I use to make and
+install after initial setup is:
 
-At least 32MB of GPU memory is required.
+    make ARCH=arm64 M=drivers/gpu/drm/rp1/rp1-vec CONFIG_DRM_RP1_VEC=m modules && \
+    sudo install -D -m 644   drivers/gpu/drm/rp1/rp1-vec/drm-rp1-vec.ko   /lib/modules/$(uname -r)/updates/drm-rp1-vec.ko && \
+    sudo depmod -a && \
+    sudo update-initramfs -u -k "6.18.39+rpt-rpi-2712"
 
-Raspbian defaults to NTSC composite output. To permanently change it
-to PAL, put `sdtv=2` in `config.txt` and reboot.
+Where `6.18.39+rpt-rpi-2712` is `uname -r`.
+
+To get composite output out of Raspberry Pi 5, first you need to solder
+a cable or header to J7 pads (next to one of HDMI ports, marked "VID").
+The round pad (closer to the board's edge) is GND, square pad is signal.
+To enable output on composite add
+
+    video=Composite-1:720x576i,tv_mode=PAL
+
+to `/boot/firmware/cmdline.txt`.
 
 Build the programs:
 
     make
-
-Twiddle the registers:
-
-    sudo ./tvctl on
-
-Ensure you see the message "Teletext output is now on."
 
 If you're connected via PAL, run the demo:
 
@@ -35,22 +46,8 @@ If you're connected via PAL, run the demo:
 
 and press the text button on your TV remote.
 
-If you're connected using NTSC, run the demo:
-
-    ./cea608
-
-and enable the TV's closed caption controls to show CC1.
-
 Detailed Usage
 --------------
-
-    tvctl on|off
-
-This tool prepares the composite out for teletext transmission by
-shifting the output picture into the VBI area. It will check the
-registers are in a known state before doing anything. "on" and
-"off" commands will have no effect if the state is already on or
-off, or if the registers are in an unknown state.
 
     teletext [-m even field line mask] [-o odd field line mask] \
              [-l white level] [-f] [-]
@@ -82,15 +79,3 @@ send packets endlessly. See
 http://www.etsi.org/deliver/etsi_i_ets/300700_300799/300706/01_60/ets_300706e01p.pdf
 
 for details of the teletext protocol.
-
-    cea608 <->
-
-Running with no arguments will show a demo.  Running "cea608 -"
-will read data from stdin and display.  The data is in binary format,
-with each field represented as two bytes of parity-encoded data.
-This is the "raw" format some capture tools can output.  Data is
-output at 59.97 fields per second.  See
-
-https://en.wikipedia.org/wiki/EIA-608
-
-for details on the protocol and links to the specifications.

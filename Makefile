@@ -6,15 +6,10 @@ INCLUDES+=-I/usr/include/libdrm -I./
 
 TELETEXT_OFILES=teletext.o render.o buffer.o hamming.o demo.o
 
-CEA608_OFILES=cea608.o render.o cea608buffer.o
-
-all: tvctl teletext cea608
+all: teletext
 
 teletext: $(TELETEXT_OFILES)
 	$(CC) -o $@ -Wl,--whole-archive $(TELETEXT_OFILES) $(LDFLAGS) -Wl,--no-whole-archive -rdynamic
-
-cea608: $(CEA608_OFILES)
-	$(CC) -o $@ -Wl,--whole-archive $(CEA608_OFILES) $(LDFLAGS) -Wl,--no-whole-archive -rdynamic
 
 %.o: %.c
 	@rm -f $@ 

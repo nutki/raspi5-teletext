@@ -13,7 +13,7 @@ custom programs directly accessing drm API). But on the upside since the
 driver modification expands the display into tetelext range instead
 of shifting upwards like `tvctl` does, the whole screen is still availiable
 for display. Also Pi5 allows to use HDMI and composite output at the same
-time, so it is possible to run X on HDMI and teletext.
+time, so it is possible to run X on HDMI alongside teletext on composite.
 
 Usage:
 

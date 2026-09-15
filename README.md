@@ -5,6 +5,7 @@ This software generates a teletext signal in software. No hardware
 mods are needed. Ported from https://github.com/ali1234/raspi-teletext
 Instead of using direct register writes to VideoCore (with `tvctl`),
 it relies on a modified `drm-rp1-vec` driver.
+
 Because Pi5's video encoder is missing a composer, the downside compared
 to original is that it is not possible to share composite output with
 other software (though it is possible to integrate teletext display with
